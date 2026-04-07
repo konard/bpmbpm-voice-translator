@@ -6,8 +6,8 @@
  *  - Перевод: Bergamot WASM (@browsermt/bergamot-translator) — полностью локально
  *  - Синтез речи: Web Speech API (SpeechSynthesis)
  *
- * Bergamot загружает нейросетевую модель (~15 МБ) при первом запуске,
- * браузер кэширует её. Последующие запуски — мгновенные.
+ * Нейросетевые модели предзагружены в папку models/ репозитория.
+ * При недоступности локальных файлов используется резервная загрузка с S3.
  *
  * Для работы SharedArrayBuffer (требование WASM-движка) нужны заголовки
  * Cross-Origin-Opener-Policy: same-origin и Cross-Origin-Embedder-Policy: require-corp.
@@ -41,12 +41,21 @@ const LANG_CODES = {
 const BERGAMOT_CDN = "https://cdn.jsdelivr.net/npm/@browsermt/bergamot-translator@0.4.9";
 
 /**
- * Базовый URL для моделей (S3 от Mozilla)
- * Для каждого направления нужны три файла: модель, лексика, словарь
+ * Локальные пути к предзагруженным моделям (относительно index.html).
+ * Файлы хранятся в репозитории в папке models/{direction}/.
  */
-const MODEL_BASE = "https://storage.googleapis.com/bergamot-models-sandbox/0.4.0";
+const LOCAL_MODEL_BASE = "./models";
 
-/** Описание файлов модели для каждого направления */
+/**
+ * Резервный URL для моделей (официальный Bergamot S3).
+ * Используется если локальные файлы недоступны.
+ */
+const REMOTE_MODEL_BASE = "https://bergamot.s3.amazonaws.com/models";
+
+/**
+ * Описание файлов модели для каждого направления.
+ * Используется при прямой загрузке буферов с прогрессом.
+ */
 const MODEL_FILES = {
   "ruen": [
     { name: "model.ruen.intgemm.alphas.bin", type: "model" },
@@ -61,151 +70,234 @@ const MODEL_FILES = {
 };
 
 // ============================================================
+// Модуль журнала (Logger)
+// ============================================================
+const Logger = (() => {
+  let logEl = null;
+
+  function init(element) {
+    logEl = element;
+  }
+
+  function log(msg, level = "info") {
+    const timestamp = new Date().toLocaleTimeString();
+    const prefix = { info: "ℹ️", warn: "⚠️", error: "❌", success: "✅" }[level] || "ℹ️";
+    const line = `[${timestamp}] ${prefix} ${msg}`;
+
+    // Вывод в консоль для отладки
+    if (level === "error") console.error(line);
+    else if (level === "warn") console.warn(line);
+    else console.log(line);
+
+    // Вывод в UI-панель
+    if (logEl) {
+      const entry = document.createElement("div");
+      entry.className = `log-entry log-entry--${level}`;
+      entry.textContent = line;
+      logEl.appendChild(entry);
+      // Автопрокрутка вниз
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+  }
+
+  return { init, log };
+})();
+
+// ============================================================
+// Загрузка файлов с отслеживанием прогресса
+// ============================================================
+
+/**
+ * Загружает файл по URL с отслеживанием прогресса.
+ * @param {string} url
+ * @param {function} onProgress — (loaded, total) => void
+ * @returns {Promise<ArrayBuffer>}
+ */
+async function fetchWithProgress(url, onProgress) {
+  const response = await fetch(url, { credentials: "omit" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+  const contentLength = parseInt(response.headers.get("Content-Length") || "0", 10);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.length;
+    if (onProgress) onProgress(loaded, contentLength || loaded);
+  }
+
+  const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result.buffer;
+}
+
+/**
+ * Загружает файл, пробуя сначала локальный URL, затем удалённый.
+ * @param {string} localUrl
+ * @param {string} remoteUrl
+ * @param {function} onProgress
+ * @returns {Promise<ArrayBuffer>}
+ */
+async function fetchLocalOrRemote(localUrl, remoteUrl, onProgress) {
+  try {
+    const buf = await fetchWithProgress(localUrl, onProgress);
+    Logger.log(`Загружен локально: ${localUrl.split("/").pop()} (${Math.round(buf.byteLength / 1024)} КБ)`, "success");
+    return buf;
+  } catch (localErr) {
+    Logger.log(`Локальный файл недоступен: ${localErr.message}. Загрузка с сервера: ${remoteUrl}`, "warn");
+    const buf = await fetchWithProgress(remoteUrl, onProgress);
+    Logger.log(`Загружен с сервера: ${remoteUrl.split("/").pop()} (${Math.round(buf.byteLength / 1024)} КБ)`, "success");
+    return buf;
+  }
+}
+
+// ============================================================
 // Модуль перевода Bergamot (BergamotTranslator)
 // ============================================================
 const BergamotTranslator = (() => {
-  // Кэш загруженных моделей: { "ruen": { model, lex, vocab }, ... }
-  const modelCache = {};
+  // Кэш загруженных буферов моделей: { "ruen": {model, lex, vocab}, ... }
+  const bufferCache = {};
 
-  // Загруженный WASM-модуль
-  let TranslationWorker = null;
-
-  /**
-   * Загружает один файл модели по URL с отслеживанием прогресса
-   * @param {string} url
-   * @param {function} onProgress — (loaded, total) => void
-   * @returns {Promise<ArrayBuffer>}
-   */
-  async function fetchWithProgress(url, onProgress) {
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`Ошибка загрузки ${url}: HTTP ${response.status}`);
-    }
-    const contentLength = parseInt(response.headers.get("Content-Length") || "0", 10);
-    const reader = response.body.getReader();
-    const chunks = [];
-    let loaded = 0;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      loaded += value.length;
-      if (onProgress) onProgress(loaded, contentLength || loaded);
-    }
-
-    // Объединяем чанки в один ArrayBuffer
-    const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result.buffer;
-  }
+  // Экземпляр LatencyOptimisedTranslator (один на весь сеанс)
+  let translatorInstance = null;
 
   /**
-   * Загружает все файлы модели для заданного направления
+   * Загружает все файлы модели для заданного направления с прогрессом.
    * @param {string} direction — "ruen" или "enru"
    * @param {function} onProgress — (percent, label) => void
-   * @returns {Promise<{model, lex, vocab}>}
+   * @returns {Promise<{model:ArrayBuffer, lex:ArrayBuffer, vocab:ArrayBuffer}>}
    */
-  async function loadModel(direction, onProgress) {
-    if (modelCache[direction]) return modelCache[direction];
+  async function preloadBuffers(direction, onProgress) {
+    if (bufferCache[direction]) return bufferCache[direction];
 
     const files = MODEL_FILES[direction];
-    const buffers = {};
+    const result = {};
     let fileIdx = 0;
 
     for (const file of files) {
       fileIdx++;
-      const url = `${MODEL_BASE}/${direction}/${file.name}`;
-      const label = `Загрузка файла ${fileIdx}/${files.length}: ${file.name}`;
+      const label = `Файл ${fileIdx}/${files.length}: ${file.name}`;
+      const localUrl  = `${LOCAL_MODEL_BASE}/${direction}/${file.name}`;
+      const remoteUrl = `${REMOTE_MODEL_BASE}/${direction}/${file.name}`;
 
-      const buf = await fetchWithProgress(url, (loaded, total) => {
-        const pct = total ? Math.round((loaded / total) * 100) : 0;
+      Logger.log(`Начало загрузки: ${label}`, "info");
+      if (onProgress) onProgress(
+        Math.round(((fileIdx - 1) / files.length) * 100),
+        label
+      );
+
+      result[file.type] = await fetchLocalOrRemote(localUrl, remoteUrl, (loaded, total) => {
+        const filePct = total ? Math.round((loaded / total) * 100) : 0;
         if (onProgress) onProgress(
-          // Общий прогресс: каждый файл — 1/3
-          Math.round(((fileIdx - 1) / files.length + (pct / 100) / files.length) * 100),
-          `${label} (${pct}%)`
+          Math.round(((fileIdx - 1) / files.length + (filePct / 100) / files.length) * 100),
+          `${label} (${filePct}%)`
         );
       });
-      buffers[file.type] = buf;
     }
 
-    if (onProgress) onProgress(100, "Модель загружена");
-    modelCache[direction] = buffers;
-    return buffers;
+    if (onProgress) onProgress(100, "Буферы модели загружены");
+    bufferCache[direction] = result;
+    return result;
   }
 
   /**
-   * Инициализирует движок Bergamot (загружает WASM через importScripts CDN)
-   * @returns {Promise<object>} — экземпляр TranslationService
+   * Инициализирует экземпляр Bergamot LatencyOptimisedTranslator
+   * с собственным механизмом загрузки модели (без обращения к реестру S3).
+   *
+   * @param {string} direction — "ruen" или "enru"
+   * @param {function} onProgress
+   * @returns {Promise<LatencyOptimisedTranslator>}
    */
-  async function initEngine(onProgress) {
-    if (TranslationWorker) return TranslationWorker;
+  async function initTranslator(direction, onProgress) {
+    if (translatorInstance) return translatorInstance;
 
+    Logger.log("Загрузка WASM-движка Bergamot с CDN...", "info");
     if (onProgress) onProgress(0, "Загрузка WASM-движка...");
 
-    // Динамически импортируем JS-обёртку из CDN
-    const module = await import(`${BERGAMOT_CDN}/translator.js`);
-    TranslationWorker = module;
+    // Импортируем API Bergamot из CDN
+    const { LatencyOptimisedTranslator, TranslatorBacking } = await import(`${BERGAMOT_CDN}/translator.js`);
 
-    if (onProgress) onProgress(100, "WASM-движок готов");
-    return TranslationWorker;
+    Logger.log("WASM-модуль импортирован, загружаем файлы модели...", "success");
+    if (onProgress) onProgress(5, "WASM загружен, загружаем модели...");
+
+    // Предзагружаем буферы модели
+    const buffers = await preloadBuffers(direction, (pct, label) => {
+      if (onProgress) onProgress(5 + Math.round(pct * 0.90), label);
+    });
+
+    Logger.log("Создаём TranslatorBacking с локальными буферами...", "info");
+
+    // Создаём кастомный backing, который переопределяет loadTranslationModel
+    // чтобы использовать уже загруженные буферы вместо загрузки из реестра.
+    const backing = new TranslatorBacking({
+      // Не нужен timeout, т.к. буферы уже загружены
+      downloadTimeout: 0
+    });
+
+    // Переопределяем getTranslationModel для использования наших буферов
+    backing.getTranslationModel = async ({ from, to }, _options) => {
+      const key = `${from}${to}`;
+      const cached = bufferCache[key];
+      if (!cached) {
+        throw new Error(`Буферы модели для ${from}->${to} не загружены`);
+      }
+      Logger.log(`Подача буферов модели ${key} в Bergamot`, "info");
+      // Bergamot ожидает: { model, shortlist, vocabs, qualityModel?, config? }
+      return {
+        model: cached.model,
+        shortlist: cached.lex,
+        vocabs: [cached.vocab],
+        qualityModel: null,
+        config: {}
+      };
+    };
+
+    translatorInstance = new LatencyOptimisedTranslator({}, backing);
+
+    Logger.log("Движок Bergamot готов к работе!", "success");
+    if (onProgress) onProgress(100, "Движок готов!");
+    return translatorInstance;
   }
 
   /**
    * Переводит текст
    * @param {string} text — исходный текст
    * @param {string} direction — "ruen" или "enru"
-   * @param {function} onModelProgress — прогресс загрузки модели
+   * @param {function} onModelProgress — прогресс загрузки
    * @returns {Promise<string>} — переведённый текст
    */
   async function translate(text, direction, onModelProgress) {
     if (!text || !text.trim()) return "";
 
-    // Шаг 1: инициализация движка
-    const engine = await initEngine(onModelProgress);
+    const from = direction.slice(0, 2);
+    const to   = direction.slice(2, 4);
 
-    // Шаг 2: загрузка модели
-    const modelBuffers = await loadModel(direction, onModelProgress);
+    Logger.log(`Перевод (${from}→${to}): "${text.substring(0, 60)}${text.length > 60 ? "..." : ""}"`, "info");
 
-    // Шаг 3: создание TranslationService и перевод
-    // API @browsermt/bergamot-translator:
-    //   new TranslationService(config) → service
-    //   service.translate(request) → response
-    const service = new engine.TranslationService({ cacheSize: 0 });
+    const translator = await initTranslator(direction, onModelProgress);
+    const response = await translator.translate({ from, to, text, html: false });
 
-    const [srcLang, tgtLang] = direction.length === 4
-      ? [direction.slice(0, 2), direction.slice(2)]
-      : direction.split("-");
-
-    const languageModel = service.loadModel(
-      srcLang,
-      tgtLang,
-      modelBuffers.model,
-      modelBuffers.lex,
-      modelBuffers.vocab
-    );
-
-    const request = {
-      texts: [{ text, html: false }],
-      qualityScores: false,
-      alignments: false,
-      sentenceMappings: false
-    };
-
-    const response = await service.translate(languageModel, request);
-    service.delete();
-
-    // Извлекаем результат из ответа
-    const result = response.get(request.texts[0]);
-    return result ? result.translation.text : text;
+    const result = response.target.text;
+    Logger.log(`Результат: "${result.substring(0, 60)}${result.length > 60 ? "..." : ""}"`, "success");
+    return result;
   }
 
-  return { translate };
+  /** Сбрасывает состояние при смене направления перевода */
+  function reset() {
+    translatorInstance = null;
+    Logger.log("Состояние движка сброшено", "info");
+  }
+
+  return { translate, reset };
 })();
 
 // ============================================================
@@ -213,12 +305,15 @@ const BergamotTranslator = (() => {
 // ============================================================
 const FallbackTranslator = {
   async translate(text, langPair) {
+    Logger.log(`MyMemory API: "${text.substring(0, 40)}..." (${langPair})`, "warn");
     const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${langPair}`;
     const response = await fetch(url);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     if (data.responseStatus !== 200) throw new Error(data.responseDetails);
-    return data.responseData.translatedText;
+    const result = data.responseData.translatedText;
+    Logger.log(`MyMemory результат: "${result.substring(0, 40)}..."`, "info");
+    return result;
   }
 };
 
@@ -242,6 +337,7 @@ const SpeechSynthesizer = {
     );
     utterance.voice = genderVoice || matching[0] || null;
 
+    Logger.log(`Озвучка (${lang}): "${text.substring(0, 40)}..."`, "info");
     window.speechSynthesis.speak(utterance);
   }
 };
@@ -274,6 +370,8 @@ const SpeechRecognizer = (() => {
     interimText = "";
     isRunning = true;
 
+    Logger.log(`Распознавание речи запущено (${lang})`, "info");
+
     recognition.onresult = (event) => {
       interimText = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -290,6 +388,7 @@ const SpeechRecognizer = (() => {
       pauseTimer = setTimeout(() => {
         const blockText = (finalText + interimText).trim();
         if (blockText) {
+          Logger.log(`Блок речи зафиксирован: "${blockText.substring(0, 60)}..."`, "info");
           onFinal(blockText);
           finalText = "";
           interimText = "";
@@ -299,6 +398,7 @@ const SpeechRecognizer = (() => {
 
     recognition.onerror = (event) => {
       if (event.error !== "no-speech") {
+        Logger.log(`Ошибка распознавания: ${event.error}`, "error");
         onError(`Ошибка распознавания: ${event.error}`);
       }
     };
@@ -317,6 +417,7 @@ const SpeechRecognizer = (() => {
       recognition.stop();
       recognition = null;
     }
+    Logger.log("Распознавание речи остановлено", "info");
   }
 
   return { start, stop };
@@ -327,32 +428,36 @@ const SpeechRecognizer = (() => {
 // ============================================================
 const App = (() => {
   let isActive = false;
-  let bergamotReady = false;   // движок Bergamot инициализирован?
-  const el = {};               // кэш DOM-элементов
+  let bergamotReady = false;
+  const el = {};
 
-  /** Вспомогательная функция: получить direction-ключ для модели */
   function getModelDirection() {
     return config.translationDirection.replace("-", "");  // "ru-en" → "ruen"
   }
 
-  /** Инициализация после загрузки DOM */
   async function init() {
-    el.startBtn       = document.getElementById("startBtn");
-    el.stopBtn        = document.getElementById("stopBtn");
-    el.statusEl       = document.getElementById("status");
-    el.sourceText     = document.getElementById("sourceText");
-    el.targetText     = document.getElementById("targetText");
-    el.sourceLang     = document.getElementById("sourceLangLabel");
-    el.targetLang     = document.getElementById("targetLangLabel");
-    el.dirSelect      = document.getElementById("dirSelect");
-    el.genderSelect   = document.getElementById("genderSelect");
-    el.rateInput      = document.getElementById("rateInput");
-    el.pauseInput     = document.getElementById("pauseInput");
-    el.rateValue      = document.getElementById("rateValue");
-    el.pauseValue     = document.getElementById("pauseValue");
-    el.modelProgress  = document.getElementById("modelProgress");
+    el.startBtn           = document.getElementById("startBtn");
+    el.stopBtn            = document.getElementById("stopBtn");
+    el.statusEl           = document.getElementById("status");
+    el.sourceText         = document.getElementById("sourceText");
+    el.targetText         = document.getElementById("targetText");
+    el.sourceLang         = document.getElementById("sourceLangLabel");
+    el.targetLang         = document.getElementById("targetLangLabel");
+    el.dirSelect          = document.getElementById("dirSelect");
+    el.genderSelect       = document.getElementById("genderSelect");
+    el.rateInput          = document.getElementById("rateInput");
+    el.pauseInput         = document.getElementById("pauseInput");
+    el.rateValue          = document.getElementById("rateValue");
+    el.pauseValue         = document.getElementById("pauseValue");
+    el.modelProgress      = document.getElementById("modelProgress");
     el.modelProgressBar   = document.getElementById("modelProgressBar");
     el.modelProgressLabel = document.getElementById("modelProgressLabel");
+    el.logPanel           = document.getElementById("logPanel");
+
+    // Инициализируем журнал
+    Logger.init(el.logPanel);
+    Logger.log("Приложение запущено", "info");
+    Logger.log(`SharedArrayBuffer: ${typeof SharedArrayBuffer !== "undefined" ? "доступен" : "недоступен (COOP/COEP не установлены)"}`, "info");
 
     loadConfigToUI();
 
@@ -368,27 +473,34 @@ const App = (() => {
 
     document.getElementById("applyConfig").addEventListener("click", applyConfig);
 
-    // Предзагружаем движок и модель для текущего направления
+    document.getElementById("clearLogBtn").addEventListener("click", () => {
+      el.logPanel.innerHTML = "";
+      Logger.log("Журнал очищен", "info");
+    });
+
     await preloadModel();
   }
 
-  /** Предзагружает WASM-движок и модель перевода */
   async function preloadModel() {
     const direction = getModelDirection();
     setStatus("Загрузка WASM-движка и модели перевода...", "loading");
     showProgress(true);
 
+    Logger.log(`Предзагрузка модели для направления: ${direction}`, "info");
+
     try {
-      await BergamotTranslator.translate("test", direction, (pct, label) => {
+      // Тестовый перевод инициализирует всё: движок + модель
+      await BergamotTranslator.translate("тест", direction, (pct, label) => {
         updateProgress(pct, label);
       });
       bergamotReady = true;
       setStatus("Движок готов. Нажмите «Старт»", "ready");
       showProgress(false);
       el.startBtn.disabled = false;
+      Logger.log("Движок Bergamot успешно готов к работе!", "success");
     } catch (err) {
-      // Bergamot не загрузился — сообщаем, что будет использован запасной вариант
-      console.warn("Bergamot не доступен, используется MyMemory API:", err);
+      Logger.log(`Bergamot недоступен: ${err.message}`, "error");
+      Logger.log("Используется резервный переводчик MyMemory API", "warn");
       bergamotReady = false;
       setStatus("Локальный движок недоступен → используется MyMemory API. Нажмите «Старт»", "ready");
       showProgress(false);
@@ -397,19 +509,19 @@ const App = (() => {
   }
 
   function loadConfigToUI() {
-    el.dirSelect.value    = config.translationDirection;
-    el.genderSelect.value = config.voiceGender;
-    el.rateInput.value    = config.speechRate;
+    el.dirSelect.value        = config.translationDirection;
+    el.genderSelect.value     = config.voiceGender;
+    el.rateInput.value        = config.speechRate;
     el.rateValue.textContent  = config.speechRate;
-    el.pauseInput.value   = config.pauseDuration;
+    el.pauseInput.value       = config.pauseDuration;
     el.pauseValue.textContent = config.pauseDuration + " мс";
     updateLangLabels();
   }
 
   function updateLangLabels() {
     const labels = {
-      "ru-en": { source: "Русский", target: "Английский" },
-      "en-ru": { source: "Английский", target: "Русский" }
+      "ru-en": { source: "Русский",    target: "Английский" },
+      "en-ru": { source: "Английский", target: "Русский"    }
     };
     const l = labels[config.translationDirection];
     el.sourceLang.textContent = l.source;
@@ -419,17 +531,18 @@ const App = (() => {
   function applyConfig() {
     const prevDirection = config.translationDirection;
     config.translationDirection = el.dirSelect.value;
-    config.voiceGender  = el.genderSelect.value;
-    config.speechRate   = parseFloat(el.rateInput.value);
-    config.pauseDuration = parseInt(el.pauseInput.value, 10);
+    config.voiceGender          = el.genderSelect.value;
+    config.speechRate           = parseFloat(el.rateInput.value);
+    config.pauseDuration        = parseInt(el.pauseInput.value, 10);
 
     updateLangLabels();
     setStatus("Настройки применены", "ready");
+    Logger.log(`Настройки: направление=${config.translationDirection}, скорость=${config.speechRate}`, "info");
 
-    // Если направление изменилось — предзагружаем новую модель
     if (config.translationDirection !== prevDirection) {
       bergamotReady = false;
-      if (isActive) { stopTranslation(); }
+      BergamotTranslator.reset();
+      if (isActive) stopTranslation();
       preloadModel();
       return;
     }
@@ -447,6 +560,7 @@ const App = (() => {
     el.startBtn.disabled = true;
     el.stopBtn.disabled  = false;
     setStatus("Слушаю...");
+    Logger.log("Сеанс перевода начат", "success");
 
     const langs = LANG_CODES[config.translationDirection];
 
@@ -466,11 +580,8 @@ const App = (() => {
           let translatedText;
 
           if (bergamotReady) {
-            // Используем локальный Bergamot WASM
-            const direction = getModelDirection();
-            translatedText = await BergamotTranslator.translate(text, direction);
+            translatedText = await BergamotTranslator.translate(text, getModelDirection());
           } else {
-            // Резервный вариант — MyMemory API
             const [src, tgt] = config.translationDirection.split("-");
             translatedText = await FallbackTranslator.translate(text, `${src}|${tgt}`);
           }
@@ -478,20 +589,17 @@ const App = (() => {
           el.targetText.textContent = translatedText;
           setStatus("Озвучиваю...");
 
-          SpeechSynthesizer.speak(
-            translatedText,
-            langs.target,
-            config.voiceGender,
-            config.speechRate
-          );
+          SpeechSynthesizer.speak(translatedText, langs.target, config.voiceGender, config.speechRate);
 
           setStatus("Слушаю...");
         } catch (err) {
+          Logger.log(`Ошибка перевода: ${err.message}`, "error");
           setStatus(`Ошибка перевода: ${err.message}`, "error");
         }
       },
 
       onError: (msg) => {
+        Logger.log(`Ошибка: ${msg}`, "error");
         setStatus(msg, "error");
         stopTranslation();
       }
@@ -508,11 +616,12 @@ const App = (() => {
     el.startBtn.disabled = false;
     el.stopBtn.disabled  = true;
     setStatus("Остановлено");
+    Logger.log("Сеанс перевода завершён", "info");
   }
 
   function setStatus(msg, type = "") {
     el.statusEl.textContent = msg;
-    el.statusEl.className = "status" + (type ? ` status--${type}` : "");
+    el.statusEl.className   = "status" + (type ? ` status--${type}` : "");
   }
 
   function showProgress(visible) {
@@ -520,7 +629,7 @@ const App = (() => {
   }
 
   function updateProgress(pct, label) {
-    el.modelProgressBar.style.width = pct + "%";
+    el.modelProgressBar.style.width   = pct + "%";
     el.modelProgressLabel.textContent = label;
   }
 
