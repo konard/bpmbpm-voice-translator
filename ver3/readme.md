@@ -27,8 +27,9 @@ python -m http.server 8000
 
 ### На GitHub Pages
 
-Просто разместите файлы папки `ver3/` в репозитории с включёнными GitHub Pages. Заголовки COOP/COEP, необходимые для SharedArrayBuffer, устанавливаются автоматически через `coi-serviceworker.js`.
-
+Просто разместите файлы папки `ver3/` в репозитории с включёнными GitHub Pages. Заголовки COOP/COEP, необходимые для SharedArrayBuffer, устанавливаются автоматически через `coi-serviceworker.js`.  
+- run github
+github pages https://bpmbpm.github.io/voice-translator/ver3/index.html
 ## Структура файлов
 
 ```
