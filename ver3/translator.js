@@ -311,6 +311,11 @@ const BergamotTranslator = (() => {
         get: (_target, name) => (...args) => call(name, ...args)
       });
 
+      // Инициализируем воркер: создаёт this.models = new Map() и загружает WASM-модуль.
+      // Без этого вызова hasTranslationModel() бросает:
+      // "Cannot read properties of undefined (reading 'has')"
+      await call("initialize", backing.options);
+
       return { worker, exports };
     };
 
