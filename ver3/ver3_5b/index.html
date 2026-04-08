@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Голосовой переводчик (Bergamot) ver3.5b</title>
+
+  <!--
+    coi-serviceworker — устанавливает заголовки Cross-Origin-Opener-Policy и
+    Cross-Origin-Embedder-Policy через Service Worker, что необходимо для
+    SharedArrayBuffer (используется WASM-движком Bergamot).
+    Работает на GitHub Pages и на локальном localhost.
+    Источник: https://github.com/gzuidhof/coi-serviceworker
+  -->
+  <script src="../coi-serviceworker.js"></script>
+
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #f0f4f8;
+      color: #1a202c;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px;
+    }
+
+    h1 {
+      font-size: 1.8rem;
+      font-weight: 700;
+      color: #2d3748;
+      margin-bottom: 4px;
+      text-align: center;
+    }
+
+    .subtitle {
+      font-size: 0.85rem;
+      color: #718096;
+      margin-bottom: 16px;
+      text-align: center;
+    }
+
+    /* ---- Статус ---- */
+    .status {
+      display: inline-block;
+      padding: 6px 16px;
+      border-radius: 20px;
+      background: #e2e8f0;
+      color: #4a5568;
+      font-size: 0.9rem;
+      margin-bottom: 12px;
+      transition: background 0.2s;
+      max-width: 700px;
+      text-align: center;
+    }
+
+    .status--error   { background: #fed7d7; color: #c53030; }
+    .status--loading { background: #ebf8ff; color: #2b6cb0; }
+    .status--ready   { background: #f0fff4; color: #276749; }
+    .status--warn    { background: #fefcbf; color: #975a16; }
+
+    /* ---- Чек-лист инициализации ---- */
+    .init-checklist {
+      width: 100%;
+      max-width: 500px;
+      margin-bottom: 16px;
+      background: #fff;
+      border-radius: 10px;
+      padding: 14px 18px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+    }
+
+    .init-checklist__title {
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: #4a5568;
+      margin-bottom: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .check-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 0;
+      font-size: 0.88rem;
+      color: #718096;
+      transition: color 0.2s;
+    }
+
+    .check-item__icon {
+      width: 18px;
+      text-align: center;
+      flex-shrink: 0;
+    }
+
+    .check-item--pending  .check-item__icon { color: #cbd5e0; }
+    .check-item--loading  { color: #2b6cb0; }
+    .check-item--loading  .check-item__icon { color: #4299e1; }
+    .check-item--ok       { color: #276749; }
+    .check-item--ok       .check-item__icon { color: #48bb78; }
+    .check-item--warn     { color: #975a16; }
+    .check-item--warn     .check-item__icon { color: #ecc94b; }
+    .check-item--error    { color: #c53030; }
+    .check-item--error    .check-item__icon { color: #fc8181; }
+
+    /* ---- Прогресс загрузки модели ---- */
+    .model-progress {
+      width: 100%;
+      max-width: 500px;
+      margin-bottom: 16px;
+      display: none;
+    }
+
+    .model-progress.visible { display: block; }
+
+    .model-progress__label {
+      font-size: 0.82rem;
+      color: #718096;
+      margin-bottom: 6px;
+      text-align: center;
+    }
+
+    .model-progress__bar-wrap {
+      background: #e2e8f0;
+      border-radius: 6px;
+      height: 10px;
+      overflow: hidden;
+    }
+
+    .model-progress__bar {
+      height: 100%;
+      background: #667eea;
+      border-radius: 6px;
+      width: 0%;
+      transition: width 0.3s;
+    }
+
+    /* ---- Кнопки управления ---- */
+    .controls {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+
+    .btn {
+      padding: 12px 32px;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.1s;
+    }
+
+    .btn:active { transform: scale(0.97); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn--start:disabled { cursor: default; }
+
+    .btn--start { background: #48bb78; color: #fff; }
+    .btn--start:not(:disabled):hover { background: #38a169; }
+
+    .btn--stop { background: #fc8181; color: #fff; }
+    .btn--stop:not(:disabled):hover { background: #e53e3e; }
+
+    /* ---- Панели текста ---- */
+    .panels {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      width: 100%;
+      max-width: 900px;
+      margin-bottom: 20px;
+    }
+
+    @media (max-width: 600px) {
+      .panels { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: #fff;
+      border-radius: 12px;
+      padding: 20px;
+      min-height: 140px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+
+    .panel__label {
+      font-size: 0.78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #718096;
+      margin-bottom: 10px;
+    }
+
+    .panel__text {
+      font-size: 1.05rem;
+      line-height: 1.6;
+      color: #2d3748;
+      min-height: 60px;
+    }
+
+    /* ---- Настройки ---- */
+    .settings {
+      width: 100%;
+      max-width: 900px;
+      background: #fff;
+      border-radius: 12px;
+      padding: 20px 24px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+
+    .settings__title {
+      font-size: 1rem;
+      font-weight: 700;
+      color: #2d3748;
+      margin-bottom: 16px;
+    }
+
+    .settings__grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 600px) {
+      .settings__grid { grid-template-columns: 1fr; }
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .field label {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: #718096;
+    }
+
+    .field select {
+      padding: 8px 10px;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      background: #f7fafc;
+      font-size: 0.95rem;
+      color: #2d3748;
+      width: 100%;
+    }
+
+    .range-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .range-row input[type="range"] { flex: 1; }
+
+    .range-value {
+      min-width: 60px;
+      font-size: 0.9rem;
+      color: #4a5568;
+      text-align: right;
+    }
+
+    .btn--apply {
+      margin-top: 16px;
+      background: #667eea;
+      color: #fff;
+      padding: 10px 24px;
+    }
+    .btn--apply:hover { background: #5a67d8; }
+
+    .hint {
+      font-size: 0.78rem;
+      color: #a0aec0;
+      margin-top: 16px;
+      text-align: center;
+      max-width: 700px;
+    }
+
+    /* ---- Панель журнала ---- */
+    .log-section {
+      width: 100%;
+      max-width: 900px;
+      margin-top: 20px;
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+      overflow: hidden;
+    }
+
+    .log-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 20px;
+      background: #f7fafc;
+      border-bottom: 1px solid #e2e8f0;
+    }
+
+    .log-header__title {
+      font-size: 0.9rem;
+      font-weight: 700;
+      color: #4a5568;
+    }
+
+    .btn--clear-log {
+      padding: 4px 12px;
+      background: #e2e8f0;
+      color: #4a5568;
+      border: none;
+      border-radius: 6px;
+      font-size: 0.78rem;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn--clear-log:hover { background: #cbd5e0; }
+
+    .log-panel {
+      height: 240px;
+      overflow-y: auto;
+      padding: 10px 16px;
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 0.78rem;
+      line-height: 1.5;
+      background: #1a202c;
+      color: #e2e8f0;
+    }
+
+    .log-entry { margin-bottom: 2px; word-break: break-word; }
+    .log-entry--info    { color: #90cdf4; }
+    .log-entry--warn    { color: #f6e05e; }
+    .log-entry--error   { color: #fc8181; }
+    .log-entry--success { color: #68d391; }
+  </style>
+</head>
+<body>
+
+  <h1>🎤 Голосовой переводчик</h1>
+  <p class="subtitle">ver3.5b · Bergamot WASM · без сервера</p>
+
+  <span class="status status--loading" id="status">Инициализация...</span>
+
+  <!-- Чек-лист инициализации -->
+  <div class="init-checklist" id="initChecklist">
+    <div class="init-checklist__title">Подготовка системы</div>
+
+    <div class="check-item check-item--pending" id="chk-browser">
+      <span class="check-item__icon">○</span>
+      <span class="check-item__label">Совместимость браузера</span>
+    </div>
+    <div class="check-item check-item--pending" id="chk-sab">
+      <span class="check-item__icon">○</span>
+      <span class="check-item__label">SharedArrayBuffer (COOP/COEP)</span>
+    </div>
+    <div class="check-item check-item--pending" id="chk-mic">
+      <span class="check-item__icon">○</span>
+      <span class="check-item__label">Доступ к микрофону</span>
+    </div>
+    <div class="check-item check-item--pending" id="chk-wasm">
+      <span class="check-item__icon">○</span>
+      <span class="check-item__label">Загрузка WASM-движка Bergamot</span>
+    </div>
+    <div class="check-item check-item--pending" id="chk-model">
+      <span class="check-item__icon">○</span>
+      <span class="check-item__label">Загрузка модели перевода</span>
+    </div>
+  </div>
+
+  <!-- Прогресс загрузки модели -->
+  <div class="model-progress" id="modelProgress">
+    <div class="model-progress__label" id="modelProgressLabel">Загрузка модели перевода...</div>
+    <div class="model-progress__bar-wrap">
+      <div class="model-progress__bar" id="modelProgressBar"></div>
+    </div>
+  </div>
+
+  <!-- Кнопки управления -->
+  <div class="controls">
+    <button class="btn btn--start" id="startBtn" disabled>▶ Старт</button>
+    <button class="btn btn--stop"  id="stopBtn"  disabled>■ Стоп</button>
+  </div>
+
+  <!-- Панели текста -->
+  <div class="panels">
+    <div class="panel">
+      <div class="panel__label" id="sourceLangLabel">Исходный текст</div>
+      <div class="panel__text" id="sourceText">— Говорите в микрофон...</div>
+    </div>
+    <div class="panel">
+      <div class="panel__label" id="targetLangLabel">Перевод</div>
+      <div class="panel__text" id="targetText">— Перевод появится здесь...</div>
+    </div>
+  </div>
+
+  <!-- Настройки -->
+  <div class="settings">
+    <div class="settings__title">⚙️ Настройки</div>
+    <div class="settings__grid">
+
+      <div class="field">
+        <label for="dirSelect">Направление перевода</label>
+        <select id="dirSelect">
+          <option value="ru-en">Русский → Английский</option>
+          <option value="en-ru">Английский → Русский</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="genderSelect">Голос озвучки</label>
+        <select id="genderSelect">
+          <option value="female">Женский</option>
+          <option value="male">Мужской</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="rateInput">Скорость произношения</label>
+        <div class="range-row">
+          <input type="range" id="rateInput" min="0.5" max="2.0" step="0.1" value="1.0">
+          <span class="range-value" id="rateValue">1.0</span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="pauseInput">Пауза для конца блока</label>
+        <div class="range-row">
+          <input type="range" id="pauseInput" min="500" max="4000" step="100" value="1500">
+          <span class="range-value" id="pauseValue">1500 мс</span>
+        </div>
+      </div>
+
+    </div>
+    <button class="btn btn--apply" id="applyConfig">Применить настройки</button>
+  </div>
+
+  <p class="hint">
+    Перевод выполняется <strong>полностью локально</strong> в браузере с помощью
+    нейросетевого движка Bergamot (WASM). Модели предзагружены в репозиторий (~30 МБ).
+    Распознавание речи: Chrome / Edge.
+  </p>
+
+  <!-- Панель журнала -->
+  <div class="log-section">
+    <div class="log-header">
+      <span class="log-header__title">📋 Журнал статусов</span>
+      <button class="btn--clear-log" id="clearLogBtn">Очистить</button>
+    </div>
+    <div class="log-panel" id="logPanel"></div>
+  </div>
+
+  <script type="module" src="translator.js"></script>
+</body>
+</html>
