@@ -75,6 +75,12 @@
       border-radius: 10px;
       padding: 14px 18px;
       box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+      transition: opacity 0.4s;
+    }
+
+    /* Скрыть чек-лист после завершения инициализации */
+    .init-checklist--hidden {
+      display: none;
     }
 
     .init-checklist__title {
@@ -84,6 +90,29 @@
       margin-bottom: 10px;
       text-transform: uppercase;
       letter-spacing: 0.05em;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    /* Кнопка сворачивания чек-листа */
+    .init-checklist__toggle {
+      font-size: 0.75rem;
+      color: #a0aec0;
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+
+    /* Скрыть пункты при свёрнутом состоянии */
+    .init-checklist--collapsed .check-item {
+      display: none;
+    }
+
+    .init-checklist--collapsed .init-checklist__title {
+      margin-bottom: 0;
     }
 
     .check-item {
@@ -473,7 +502,10 @@
 
   <!-- Чек-лист инициализации -->
   <div class="init-checklist" id="initChecklist">
-    <div class="init-checklist__title">Подготовка системы</div>
+    <div class="init-checklist__title" id="initChecklistTitle">
+      <span>Подготовка системы</span>
+      <span class="init-checklist__toggle" id="initChecklistToggle">▼ свернуть</span>
+    </div>
 
     <div class="check-item check-item--pending" id="chk-browser">
       <span class="check-item__icon">○</span>

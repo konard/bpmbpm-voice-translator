@@ -1,5 +1,5 @@
 /**
- * Голосовой переводчик ver3_6 — основной JS-модуль (ES-модуль)
+ * Голосовой переводчик ver3_6a — основной JS-модуль (ES-модуль)
  *
  * Используемые технологии:
  *  - Распознавание речи: Web Speech API (SpeechRecognition)
@@ -417,7 +417,13 @@ const SpeechRecognizer = (() => {
     };
 
     recognition.onerror = (event) => {
-      if (event.error !== "no-speech") {
+      if (event.error === "no-speech") {
+        // Нормальная ситуация — тишина, игнорируем
+      } else if (event.error === "audio-capture") {
+        // Микрофон временно занят или недоступен — предупреждаем, но не останавливаемся.
+        // SpeechRecognition попробует снова при следующем вызове recognition.start() в onend.
+        Logger.log("Ошибка захвата аудио (audio-capture) — микрофон может быть занят другим приложением. Повтор...", "warn");
+      } else {
         Logger.log(`Ошибка распознавания: ${event.error}`, "error");
         onError(`Ошибка распознавания: ${event.error}`);
       }
@@ -546,7 +552,7 @@ const App = (() => {
     el.logPanel           = document.getElementById("logPanel");
 
     Logger.init(el.logPanel);
-    Logger.log("=== Голосовой переводчик ver3_6 запускается ===", "info");
+    Logger.log("=== Голосовой переводчик ver3_6a запускается ===", "info");
 
     loadConfigToUI();
 
@@ -568,6 +574,14 @@ const App = (() => {
 
     // Кнопка открытия модального окна теста микрофона
     document.getElementById("micTestBtn").addEventListener("click", openMicModal);
+
+    // Клик по заголовку чек-листа — сворачивает/разворачивает его
+    document.getElementById("initChecklistTitle").addEventListener("click", () => {
+      const checklist = document.getElementById("initChecklist");
+      const toggle    = document.getElementById("initChecklistToggle");
+      const collapsed = checklist.classList.toggle("init-checklist--collapsed");
+      toggle.textContent = collapsed ? "▶ развернуть" : "▼ свернуть";
+    });
 
     initMicModal();
 
@@ -713,9 +727,10 @@ const App = (() => {
       if (microphoneReady) {
         setStatus("Готов. Нажмите «Старт» для начала перевода.", "ready");
       } else {
-        setStatus("Движок готов. Микрофон недоступен — нажмите «Тест микрофона».", "warn");
+        setStatus("Движок готов. Нажмите «Старт» (или проверьте микрофон).", "ready");
       }
       el.startBtn.disabled = false;
+      hideInitChecklist();
 
     } catch (err) {
       Logger.log(`Bergamot недоступен: ${err.message}`, "error");
@@ -729,6 +744,7 @@ const App = (() => {
 
       setStatus("Локальный движок недоступен → MyMemory API. Нажмите «Старт».", "warn");
       el.startBtn.disabled = false;
+      hideInitChecklist();
     }
   }
 
@@ -845,6 +861,18 @@ const App = (() => {
   function setStatus(msg, type = "") {
     el.statusEl.textContent = msg;
     el.statusEl.className   = "status" + (type ? ` status--${type}` : "");
+  }
+
+  /**
+   * Скрывает чек-лист инициализации («Подготовка системы»).
+   * Вызывается после завершения всех шагов инициализации.
+   * Задержка 1.5 с позволяет пользователю увидеть финальный статус чек-листа.
+   */
+  function hideInitChecklist() {
+    setTimeout(() => {
+      const el = document.getElementById("initChecklist");
+      if (el) el.classList.add("init-checklist--hidden");
+    }, 1500);
   }
 
   function showProgress(visible) {
