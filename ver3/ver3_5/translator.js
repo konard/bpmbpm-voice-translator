@@ -41,10 +41,10 @@ const LANG_CODES = {
 };
 
 /**
- * Базовый URL CDN для Bergamot WASM
- * Версия 0.4.9 — последняя стабильная из @browsermt/bergamot-translator
+ * Локальный путь к файлам Bergamot WASM (относительно index.html).
+ * Файлы скопированы из @browsermt/bergamot-translator@0.4.9 в папку ../bergamot/.
  */
-const BERGAMOT_CDN = "https://cdn.jsdelivr.net/npm/@browsermt/bergamot-translator@0.4.9";
+const BERGAMOT_LOCAL = "../bergamot";
 
 /**
  * Локальные пути к предзагруженным моделям (относительно index.html).
@@ -164,12 +164,12 @@ async function fetchWithProgress(url, onProgress) {
 async function fetchLocalOrRemote(localUrl, remoteUrl, onProgress) {
   try {
     const buf = await fetchWithProgress(localUrl, onProgress);
-    Logger.log(`Загружен локально: ${localUrl.split("/").pop()} (${Math.round(buf.byteLength / 1024)} КБ)`, "success");
+    Logger.log(`Загружен локально: ${localUrl} (${Math.round(buf.byteLength / 1024)} КБ)`, "success");
     return buf;
   } catch (localErr) {
     Logger.log(`Локальный файл недоступен (${localErr.message}). Загружаю с сервера...`, "warn");
     const buf = await fetchWithProgress(remoteUrl, onProgress);
-    Logger.log(`Загружен с сервера: ${remoteUrl.split("/").pop()} (${Math.round(buf.byteLength / 1024)} КБ)`, "success");
+    Logger.log(`Загружен с сервера: ${remoteUrl} (${Math.round(buf.byteLength / 1024)} КБ)`, "success");
     return buf;
   }
 }
@@ -217,10 +217,10 @@ const BergamotTranslator = (() => {
   async function initTranslator(direction, onProgress) {
     if (translatorInstance) return translatorInstance;
 
-    Logger.log("Загрузка WASM-модуля Bergamot с CDN...", "info");
+    Logger.log(`Загрузка WASM-модуля Bergamot локально: ${BERGAMOT_LOCAL}/translator.js`, "info");
     if (onProgress) onProgress(0, "Загрузка WASM-движка...");
 
-    const { LatencyOptimisedTranslator, TranslatorBacking } = await import(`${BERGAMOT_CDN}/translator.js`);
+    const { LatencyOptimisedTranslator, TranslatorBacking } = await import(`${BERGAMOT_LOCAL}/translator.js`);
 
     Logger.log("WASM-модуль успешно импортирован", "success");
     if (onProgress) onProgress(5, "WASM загружен, загружаем модели...");
@@ -249,7 +249,7 @@ const BergamotTranslator = (() => {
 
     backing.getModels = async ({ from, to }) => [{ from, to }];
 
-    const workerUrl = `${BERGAMOT_CDN}/worker/translator-worker.js`;
+    const workerUrl = `${BERGAMOT_LOCAL}/worker/translator-worker.js`;
     backing.loadWorker = async () => {
       const blob = new Blob(
         [`importScripts(${JSON.stringify(workerUrl)});`],
@@ -596,8 +596,8 @@ const App = (() => {
         Logger.log(`Микрофон не найден: ${err.message}`, "error");
         InitChecklist.setItem("chk-mic", "error", "Микрофон не найден");
       } else if (err.name === "NotReadableError" || err.name === "TrackStartError") {
-        Logger.log(`Микрофон занят другим приложением: ${err.message}`, "warn");
-        InitChecklist.setItem("chk-mic", "warn", "Микрофон занят другим приложением");
+        Logger.log(`Микрофон занят другим приложением: ${err.message}. Закройте другие вкладки браузера или приложения, использующие микрофон (видеозвонки, Zoom, Teams, Discord, OBS и др.), и перезагрузите страницу.`, "warn");
+        InitChecklist.setItem("chk-mic", "warn", "Микрофон занят (закройте приложения с микрофоном и обновите страницу)");
       } else {
         Logger.log(`Ошибка доступа к микрофону (${err.name}): ${err.message}`, "warn");
         InitChecklist.setItem("chk-mic", "warn", `Микрофон: ${err.name}`);
