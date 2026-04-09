@@ -1,5 +1,5 @@
 /**
- * Голосовой переводчик ver3_6a — основной JS-модуль (ES-модуль)
+ * Голосовой переводчик ver3 — основной JS-модуль (ES-модуль)
  *
  * Используемые технологии:
  *  - Распознавание речи: Web Speech API (SpeechRecognition)
@@ -176,6 +176,14 @@ const BergamotTranslator = (() => {
   const bufferCache = {};
   let translatorInstance = null;
 
+  /** Отклоняет промис, если он не завершился за ms миллисекунд */
+  function withTimeout(promise, ms, label) {
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Превышен таймаут ${ms} мс: ${label}`)), ms)
+    );
+    return Promise.race([promise, timeout]);
+  }
+
   async function preloadBuffers(direction, onProgress) {
     if (bufferCache[direction]) return bufferCache[direction];
 
@@ -305,7 +313,12 @@ const BergamotTranslator = (() => {
     Logger.log(`Перевод (${from}→${to}): "${text.substring(0, 60)}${text.length > 60 ? "..." : ""}"`, "info");
 
     const translator = await initTranslator(direction, onModelProgress);
-    const response = await translator.translate({ from, to, text, html: false });
+    Logger.log(`Вызов WASM translator.translate() для "${text.substring(0, 30)}"...`, "info");
+    const response = await withTimeout(
+      translator.translate({ from, to, text, html: false }),
+      15000,
+      `translator.translate(${from}→${to})`
+    );
 
     const result = response.target.text;
     Logger.log(`Результат: "${result.substring(0, 60)}${result.length > 60 ? "..." : ""}"`, "success");
@@ -390,7 +403,7 @@ const SpeechRecognizer = (() => {
     interimText = "";
     isRunning = true;
 
-    Logger.log(`Распознавание речи запущено (${lang})`, "info");
+    Logger.log(`Распознавание речи инициализировано (${lang}), запускаем...`, "info");
 
     recognition.onresult = (event) => {
       interimText = "";
@@ -430,20 +443,28 @@ const SpeechRecognizer = (() => {
     };
 
     recognition.onend = () => {
-      if (isRunning) recognition.start();
+      if (isRunning) {
+        Logger.log("SpeechRecognition: автоперезапуск — значок 🎤 в адресной строке обновится", "info");
+        recognition.start();
+      }
     };
 
+    Logger.log("Вызов recognition.start() — браузер запросит микрофон, значок 🎤 в адресной строке появится", "info");
     recognition.start();
+    Logger.log("Распознавание речи запущено", "info");
   }
 
   function stop() {
     isRunning = false;
     clearTimeout(pauseTimer);
     if (recognition) {
+      Logger.log("Вызов recognition.stop() — браузер освобождает микрофон, значок 🎤 в адресной строке исчезнет", "info");
       recognition.stop();
       recognition = null;
+      Logger.log("Распознавание речи остановлено: значок 🎤 в адресной строке браузера погашен", "info");
+    } else {
+      Logger.log("Распознавание речи остановлено", "info");
     }
-    Logger.log("Распознавание речи остановлено", "info");
   }
 
   return { start, stop };
@@ -552,7 +573,7 @@ const App = (() => {
     el.logPanel           = document.getElementById("logPanel");
 
     Logger.init(el.logPanel);
-    Logger.log("=== Голосовой переводчик ver3_6a запускается ===", "info");
+    Logger.log("=== Голосовой переводчик ver3 запускается ===", "info");
 
     loadConfigToUI();
 
@@ -656,14 +677,17 @@ const App = (() => {
     }
 
     try {
-      Logger.log("Запрашиваем доступ к микрофону...", "info");
+      Logger.log("Запрашиваем доступ к микрофону — появится значок 🎤 в адресной строке браузера...", "info");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      Logger.log("getUserMedia() успешно: значок 🎤 в адресной строке браузера теперь активен", "info");
 
       const tracks = stream.getAudioTracks();
       if (tracks.length === 0) {
         Logger.log("Разрешение получено, но аудио-трек не найден", "warn");
         InitChecklist.setItem("chk-mic", "warn", "Микрофон: трек не найден");
+        Logger.log("Останавливаем треки тестового потока — значок 🎤 в адресной строке браузера сейчас исчезнет", "info");
         stream.getTracks().forEach(t => t.stop());
+        Logger.log("Тестовый поток закрыт: значок 🎤 в адресной строке браузера погашен", "info");
         return false;
       }
 
@@ -671,7 +695,9 @@ const App = (() => {
       Logger.log(`Микрофон доступен: "${trackLabel}"`, "success");
       InitChecklist.setItem("chk-mic", "ok", `Микрофон: ${trackLabel}`);
 
+      Logger.log("Останавливаем тестовый поток микрофона — значок 🎤 в адресной строке браузера сейчас исчезнет", "info");
       stream.getTracks().forEach(t => t.stop());
+      Logger.log("Тестовый поток закрыт: значок 🎤 в адресной строке браузера погашен", "info");
       return true;
 
     } catch (err) {
@@ -707,6 +733,7 @@ const App = (() => {
     Logger.log(`Шаг 5/5: Загрузка модели для направления: ${direction}`, "info");
 
     try {
+      Logger.log("Запуск тестового перевода для прогрева движка...", "info");
       await BergamotTranslator.translate("тест", direction, (pct, label) => {
         updateProgress(pct, label);
         if (pct < 10) {
@@ -716,6 +743,7 @@ const App = (() => {
           InitChecklist.setItem("chk-model", "loading", label);
         }
       });
+      Logger.log("Тестовый перевод выполнен успешно — движок прогрет", "success");
 
       bergamotReady = true;
       InitChecklist.setItem("chk-wasm", "ok", "WASM-движок Bergamot загружен ✓");
