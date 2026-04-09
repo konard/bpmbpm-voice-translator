@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<!--
+  Эксперимент: проверка загрузки importScripts из Blob-воркера через абсолютный URL.
+
+  Проблема: Blob-воркер имеет self.location = blob:http://..., поэтому
+  относительные пути в importScripts() не разрешаются корректно.
+
+  Решение: передавать абсолютный URL файла вместо относительного.
+
+  Запустить: открыть в браузере через локальный сервер (не file://).
+  Например: python3 -m http.server 8080 && open http://localhost:8080/ver3/experiments/test-worker-blob.html
+-->
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Эксперимент: Blob Worker + importScripts</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #1a202c; color: #e2e8f0; }
+    .ok   { color: #68d391; }
+    .fail { color: #fc8181; }
+    .info { color: #90cdf4; }
+    pre   { margin: 4px 0; }
+  </style>
+</head>
+<body>
+<h2>Blob Worker + importScripts: тест</h2>
+<div id="log"></div>
+<script>
+  const logEl = document.getElementById("log");
+  function log(msg, cls = "info") {
+    const pre = document.createElement("pre");
+    pre.className = cls;
+    pre.textContent = msg;
+    logEl.appendChild(pre);
+  }
+
+  // Создаём тестовый вспомогательный файл на лету — проверяем можно ли его загрузить
+  // Для реальной проверки нужно использовать существующий файл
+
+  async function testBlobWorkerAbsoluteUrl() {
+    log("=== Тест 1: Blob-воркер с абсолютным URL importScripts ===");
+
+    // Создаём простой JS-файл для importScripts
+    const helperCode = `
+      // Вспомогательный скрипт, загружаемый через importScripts
+      self.helperLoaded = true;
+    `;
+    const helperBlob = new Blob([helperCode], { type: "application/javascript" });
+    const helperUrl  = URL.createObjectURL(helperBlob);
+
+    // Blob-воркер, который загружает helper через абсолютный URL
+    const workerCode = `
+      importScripts(${JSON.stringify(helperUrl)});
+      self.addEventListener("message", (e) => {
+        self.postMessage({ helperLoaded: self.helperLoaded === true });
+      });
+    `;
+    const workerBlob = new Blob([workerCode], { type: "application/javascript" });
+    const workerUrl  = URL.createObjectURL(workerBlob);
+    const worker     = new Worker(workerUrl);
+
+    try {
+      const result = await new Promise((resolve, reject) => {
+        worker.addEventListener("message", e => resolve(e.data));
+        worker.addEventListener("error",   e => reject(e));
+        worker.postMessage("ping");
+      });
+
+      if (result.helperLoaded) {
+        log("✅ ТЕСТ 1 ПРОЙДЕН: Blob-воркер успешно загрузил скрипт через абсолютный URL", "ok");
+      } else {
+        log("❌ ТЕСТ 1 ПРОВАЛЕН: helperLoaded = " + result.helperLoaded, "fail");
+      }
+    } catch (err) {
+      log("❌ ТЕСТ 1 ПРОВАЛЕН с ошибкой: " + err.message, "fail");
+    } finally {
+      worker.terminate();
+      URL.revokeObjectURL(workerUrl);
+      URL.revokeObjectURL(helperUrl);
+    }
+  }
+
+  async function testBlobWorkerRelativeUrl() {
+    log("=== Тест 2: Blob-воркер с относительным URL importScripts (ожидаем ошибку) ===");
+
+    // Пытаемся загрузить файл по относительному пути из Blob-воркера
+    const workerCode = `
+      try {
+        importScripts("./nonexistent-relative.js");
+        self.addEventListener("message", () => self.postMessage({ success: true }));
+      } catch (err) {
+        self.addEventListener("message", () => self.postMessage({ success: false, error: err.message }));
+      }
+    `;
+    const workerBlob = new Blob([workerCode], { type: "application/javascript" });
+    const workerUrl  = URL.createObjectURL(workerBlob);
+    const worker     = new Worker(workerUrl);
+
+    try {
+      const result = await new Promise((resolve, reject) => {
+        worker.addEventListener("message", e => resolve(e.data));
+        worker.addEventListener("error",   e => resolve({ success: false, error: e.message }));
+        worker.postMessage("ping");
+      });
+
+      if (!result.success) {
+        log("✅ ТЕСТ 2 ОЖИДАЕМО ПРОВАЛЕН (relative URL не работает из Blob-воркера): " + result.error, "ok");
+      } else {
+        log("⚠️  ТЕСТ 2: относительный URL сработал (неожиданно)", "info");
+      }
+    } catch (err) {
+      log("✅ ТЕСТ 2 ОЖИДАЕМО ПРОВАЛЕН: " + err.message, "ok");
+    } finally {
+      worker.terminate();
+      URL.revokeObjectURL(workerUrl);
+    }
+  }
+
+  async function testWorkerBaseUrl() {
+    log("=== Тест 3: Передача workerBaseUrl через options (паттерн из исправления) ===");
+
+    // Создаём «воркер», который получает baseUrl через postMessage
+    // и использует его для формирования абсолютного URL
+    const helperCode = `self.testHelperV2 = true;`;
+    const helperBlob = new Blob([helperCode], { type: "application/javascript" });
+    const helperUrl  = URL.createObjectURL(helperBlob);
+    // Извлекаем «базовый URL» — убираем имя файла, оставляем директорию
+    // (В реальном коде это будет URL директории bergamot/worker/)
+    const helperDir  = helperUrl; // для Blob URL это сам URL
+
+    const workerCode = `
+      let baseUrl = null;
+      self.addEventListener("message", async (e) => {
+        if (e.data.type === "init") {
+          baseUrl = e.data.workerBaseUrl;
+          try {
+            importScripts(baseUrl); // в тесте baseUrl = сам helperUrl
+            self.postMessage({ ok: self.testHelperV2 === true });
+          } catch (err) {
+            self.postMessage({ ok: false, error: err.message });
+          }
+        }
+      });
+    `;
+    const workerBlob = new Blob([workerCode], { type: "application/javascript" });
+    const workerUrl  = URL.createObjectURL(workerBlob);
+    const worker     = new Worker(workerUrl);
+
+    try {
+      const result = await new Promise((resolve, reject) => {
+        worker.addEventListener("message", e => resolve(e.data));
+        worker.addEventListener("error",   e => reject(e));
+        worker.postMessage({ type: "init", workerBaseUrl: helperDir });
+      });
+
+      if (result.ok) {
+        log("✅ ТЕСТ 3 ПРОЙДЕН: workerBaseUrl передаётся через options и корректно используется", "ok");
+      } else {
+        log("❌ ТЕСТ 3 ПРОВАЛЕН: " + (result.error || "неизвестная ошибка"), "fail");
+      }
+    } catch (err) {
+      log("❌ ТЕСТ 3 ПРОВАЛЕН с ошибкой: " + err.message, "fail");
+    } finally {
+      worker.terminate();
+      URL.revokeObjectURL(workerUrl);
+      URL.revokeObjectURL(helperUrl);
+    }
+  }
+
+  async function testSharedArrayBuffer() {
+    log("=== Тест 4: Доступность SharedArrayBuffer (нужен для Bergamot WASM) ===");
+    if (typeof SharedArrayBuffer !== "undefined") {
+      log("✅ SharedArrayBuffer доступен (COOP/COEP заголовки установлены)", "ok");
+    } else {
+      log("❌ SharedArrayBuffer недоступен — WASM-движок Bergamot не заработает", "fail");
+      log("   Запустите через сервер с заголовками COOP/COEP, или используйте coi-serviceworker.js", "info");
+    }
+  }
+
+  // Запускаем тесты
+  (async () => {
+    await testSharedArrayBuffer();
+    await testBlobWorkerAbsoluteUrl();
+    await testBlobWorkerRelativeUrl();
+    await testWorkerBaseUrl();
+    log("=== Тесты завершены ===", "info");
+  })();
+</script>
+</body>
+</html>

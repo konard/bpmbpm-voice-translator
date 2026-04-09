@@ -252,11 +252,15 @@ const BergamotTranslator = (() => {
 
     backing.getModels = async ({ from, to }) => [{ from, to }];
 
-    // Преобразуем относительный путь в абсолютный URL через document.baseURI.
+    // Преобразуем относительные пути в абсолютные URL через document.baseURI.
     // Это необходимо, потому что importScripts() внутри Blob-воркера разрешает
     // относительные пути относительно blob:-URL, а не страницы.
     const workerUrl = new URL(`${BERGAMOT_LOCAL}/worker/translator-worker.js`, document.baseURI).href;
+    // Базовый URL директории воркера — нужен для загрузки .wasm и .js файлов
+    // внутри Blob-воркера, где self.location = blob:-URL.
+    const workerBaseUrl = new URL(`${BERGAMOT_LOCAL}/worker/`, document.baseURI).href;
     Logger.log(`URL воркера Bergamot: ${workerUrl}`, "info");
+    Logger.log(`Базовый URL воркера: ${workerBaseUrl}`, "info");
 
     backing.loadWorker = async () => {
       const blob = new Blob(
@@ -292,7 +296,9 @@ const BergamotTranslator = (() => {
         get: (_target, name) => (...args) => call(name, ...args)
       });
 
-      await call("initialize", backing.options);
+      // Передаём workerBaseUrl в options, чтобы воркер мог правильно разрешать
+      // относительные пути к .wasm и .js файлам из Blob-воркера.
+      await call("initialize", { ...backing.options, workerBaseUrl });
 
       return { worker, exports };
     };
@@ -749,6 +755,7 @@ const App = (() => {
       InitChecklist.setItem("chk-wasm", "ok", "WASM-движок Bergamot загружен ✓");
       InitChecklist.setItem("chk-model", "ok", `Модель ${direction} загружена ✓`);
       showProgress(false);
+      setEngineIndicator("bergamot");
 
       Logger.log("=== Инициализация завершена успешно ===", "success");
 
@@ -769,6 +776,7 @@ const App = (() => {
 
       bergamotReady = false;
       showProgress(false);
+      setEngineIndicator("fallback");
 
       setStatus("Локальный движок недоступен → MyMemory API. Нажмите «Старт».", "warn");
       el.startBtn.disabled = false;
@@ -809,6 +817,7 @@ const App = (() => {
 
     if (config.translationDirection !== prevDirection) {
       bergamotReady = false;
+      setEngineIndicator("unknown");
       BergamotTranslator.reset();
       if (isActive) stopTranslation();
       preloadModel();
@@ -889,6 +898,25 @@ const App = (() => {
   function setStatus(msg, type = "") {
     el.statusEl.textContent = msg;
     el.statusEl.className   = "status" + (type ? ` status--${type}` : "");
+  }
+
+  /**
+   * Обновляет значок активного движка перевода в интерфейсе.
+   * @param {"bergamot"|"fallback"|"unknown"} engine
+   */
+  function setEngineIndicator(engine) {
+    const badge = document.getElementById("engineBadge");
+    if (!badge) return;
+    if (engine === "bergamot") {
+      badge.textContent = "🟢 Движок: Bergamot WASM (локально)";
+      badge.className = "engine-badge engine-badge--bergamot";
+    } else if (engine === "fallback") {
+      badge.textContent = "🟡 Движок: MyMemory API (онлайн)";
+      badge.className = "engine-badge engine-badge--fallback";
+    } else {
+      badge.textContent = "⏳ Движок загружается...";
+      badge.className = "engine-badge engine-badge--unknown";
+    }
   }
 
   /**

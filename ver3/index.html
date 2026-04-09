@@ -66,6 +66,34 @@
     .status--ready   { background: #f0fff4; color: #276749; }
     .status--warn    { background: #fefcbf; color: #975a16; }
 
+    /* ---- Индикатор активного движка перевода ---- */
+    .engine-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 12px;
+      border-radius: 12px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      margin-bottom: 12px;
+      letter-spacing: 0.02em;
+    }
+
+    .engine-badge--bergamot {
+      background: #e9d8fd;
+      color: #553c9a;
+    }
+
+    .engine-badge--fallback {
+      background: #fefcbf;
+      color: #744210;
+    }
+
+    .engine-badge--unknown {
+      background: #e2e8f0;
+      color: #718096;
+    }
+
     /* ---- Чек-лист инициализации ---- */
     .init-checklist {
       width: 100%;
@@ -499,6 +527,9 @@
   <p class="subtitle">на базе Bergamot (self-hosted WASM, без сервера)</p>
 
   <span class="status status--loading" id="status">Инициализация...</span>
+
+  <!-- Индикатор активного движка перевода -->
+  <span class="engine-badge engine-badge--unknown" id="engineBadge">⏳ Движок загружается...</span>
 
   <!-- Чек-лист инициализации -->
   <div class="init-checklist" id="initChecklist">

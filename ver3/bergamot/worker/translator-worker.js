@@ -240,7 +240,16 @@ class BergamotTranslatorWorker {
     loadModule() {
         return new Promise(async (resolve, reject) => {
             try {
-                const response = await self.fetch(new URL('./bergamot-translator-worker.wasm', self.location));
+                // Если передан workerBaseUrl (из Blob-воркера), используем его для
+                // формирования абсолютных URL. Иначе — self.location (стандартный воркер).
+                const baseUrl = (this.options && this.options.workerBaseUrl)
+                    ? this.options.workerBaseUrl
+                    : self.location;
+
+                const wasmUrl = new URL('bergamot-translator-worker.wasm', baseUrl);
+                const glueUrl = new URL('bergamot-translator-worker.js', baseUrl).href;
+
+                const response = await self.fetch(wasmUrl);
 
                 Object.assign(Module, {
                     instantiateWasm: (info, accept) => {
@@ -262,8 +271,10 @@ class BergamotTranslatorWorker {
                 });
 
                 // Emscripten glue code. Webpack et al. should not mangle the `Module` property name!
+                // Используем абсолютный URL вместо относительного, чтобы importScripts
+                // корректно работал из Blob-воркера (где self.location = blob:-URL).
                 self.Module = Module;
-                self.importScripts('bergamot-translator-worker.js');
+                self.importScripts(glueUrl);
             } catch (err) {
                 reject(err);
             }
